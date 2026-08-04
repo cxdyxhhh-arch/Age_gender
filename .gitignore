@@ -1,0 +1,26 @@
+# ===== 敏感配置（含真实 API Key，绝不上传）=====
+.env
+!.env.example
+
+# ===== 运行产物 =====
+run/
+screenshots/
+*.log
+*.pid
+*.meta
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+
+# ===== 系统 / 编辑器 =====
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,5 @@
+playwright>=1.44
+openai>=1.30
+python-dotenv>=1.0
+httpx>=0.25
+Pillow>=10.0
