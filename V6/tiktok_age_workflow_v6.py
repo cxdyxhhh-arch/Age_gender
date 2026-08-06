@@ -163,17 +163,29 @@ def capture_profile(url: str, headless: bool = True, timeout_ms: int = 60_000,
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 1600},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
+        try:
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 1600},
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36"
+                ),
+            )
+            page = context.new_page()
+        except Exception:
+            try:
+                browser.close()
+            finally:
+                raise
         print(f"  [snap] 打开 {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except Exception:
+            try:
+                browser.close()
+            finally:
+                raise
         try:
             page.wait_for_load_state("networkidle", timeout=30_000)
         except Exception:

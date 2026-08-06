@@ -15,8 +15,7 @@ import glob
 import json
 import os
 import sys
-import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import batch_run_v6 as b
 
@@ -43,29 +42,6 @@ def _load_disk_results() -> Dict[str, Dict[str, Any]]:
             out[key] = d
             mtimes[key] = mt
     return out
-
-
-def _row_values(r: Dict[str, Any]) -> List[str]:
-    """与 _flush 完全一致的取值逻辑：[age, final_result, confidence, error]。"""
-    def _as_str(val) -> str:
-        if val is None:
-            return ""
-        if isinstance(val, (list, dict)):
-            return json.dumps(val, ensure_ascii=False)
-        return str(val)
-
-    age_val = json.dumps(
-        r.get("age") or r.get("final_result", {}).get("age", ["Unknown"]),
-        ensure_ascii=False,
-    )
-    final_val = json.dumps(
-        r.get("final_result") or {"age": r.get("age", ["Unknown"]),
-                                  "gender": r.get("gender", "unknown")},
-        ensure_ascii=False,
-    )
-    conf_val = _as_str(r.get("confidence")) or ""
-    err_val = _as_str(r.get("error")) or ""
-    return [age_val, final_val, conf_val, err_val]
 
 
 def main() -> int:
@@ -135,7 +111,7 @@ def main() -> int:
         print("没有需要写入的行。")
         return 0
 
-    b._flush(todo, [], args.token, args.sheet2, bearer, sid)
+    b._flush(todo, args.token, args.sheet2, bearer, sid)
     print(f"\n== 恢复完成: 写入 {len(todo)}, 失败 0, 共 {len(todo)} ==")
     return 0
 

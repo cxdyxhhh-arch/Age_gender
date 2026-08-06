@@ -305,6 +305,7 @@ def read_sheet1_profile_links(spreadsheet_token: str, sheet1_name: str,
     rows = _read_rows_paginated(spreadsheet_token, sheet_id, letter, letter, bearer,
                                 page_size=500, max_pages=max_pages)
     urls: List[str] = []
+    seen_keys: set[str] = set()
     for row in rows:
         if not row:
             continue
@@ -317,7 +318,9 @@ def read_sheet1_profile_links(spreadsheet_token: str, sheet1_name: str,
             s = v.strip()
         else:
             s = str(v).strip() if v else ""
-        if s:
+        key = _normalize_url_key(s)
+        if key and key not in seen_keys:
+            seen_keys.add(key)
             urls.append(s)
     print(f"  [sheet1] 在第 {link_col + 1} 列 ({letter}) 读到 {len(urls)} 个 profile_link")
     return urls
@@ -335,7 +338,9 @@ def read_sheet2_rows(spreadsheet_token: str, sheet2_name: str) -> List[Dict[str,
     if not row1:
         raise RuntimeError(f"Sheet2 '{sheet2_name}' 为空")
     header = [str(v).strip() for v in row1[0]]
-    header = [h for h in header if h]
+    # 保留中间空列的位置；只能裁掉尾部空列，否则 header 索引会与数据行错位。
+    while header and not header[-1]:
+        header.pop()
 
     def _find_col(*keywords) -> Optional[int]:
         for i, h in enumerate(header):
@@ -344,20 +349,33 @@ def read_sheet2_rows(spreadsheet_token: str, sheet2_name: str) -> List[Dict[str,
                     return i
         return None
 
+    def _find_exact(title: str) -> Optional[int]:
+        title = title.lower()
+        for i, h in enumerate(header):
+            if h.lower() == title:
+                return i
+        return None
+
     profile_link_col = _find_col("profile_link")
     if profile_link_col is None:
         profile_link_col = _find_col("url", "handle")
     if profile_link_col is None:
         raise RuntimeError(f"Sheet2 '{sheet2_name}' 第 1 行找不到 profile_link 列")
-    age_col = _find_col(AGENT_AGE_COL)
-    final_col = _find_col(AGENT_FINAL_COL)
+    age_col = _find_exact(AGENT_AGE_COL)
+    final_col = _find_exact(AGENT_FINAL_COL)
+    agent_result_cols = [
+        (_find_exact(_agent_col_name(name, "age")),
+         _find_exact(_agent_col_name(name, "final_result")))
+        for name in _agent_names()
+    ]
     labeling_final_col = _find_col("[Labeling]final_result")
     if labeling_final_col is None:
         labeling_final_col = _find_col("[Labeling] age")
 
     # 逐列读（按关键列的最大索引 + 1），避免整表读取 10MB
-    max_col = max([i for i in [profile_link_col, age_col or 0, final_col or 0, labeling_final_col or 0]
-                    if i is not None])
+    result_cols = [i for pair in agent_result_cols for i in pair if i is not None]
+    max_col = max([i for i in [profile_link_col, age_col, final_col, labeling_final_col]
+                   if i is not None] + result_cols)
     rows = _read_rows_paginated(spreadsheet_token, sheet_id, "A", _col_letter(max_col), bearer)
 
     results: List[Dict[str, Any]] = []
@@ -371,10 +389,18 @@ def read_sheet2_rows(spreadsheet_token: str, sheet2_name: str) -> List[Dict[str,
         pl_key = _normalize_url_key(pl_raw)
         if not pl_key:
             continue
+        agent_age = _cell(age_col)
+        agent_final = _cell(final_col)
+        # 只要任一 Agent 已有结果，就视为该 URL 已处理。
+        for age_idx, final_idx in agent_result_cols:
+            if not agent_age and age_idx is not None:
+                agent_age = _cell(age_idx)
+            if not agent_final and final_idx is not None:
+                agent_final = _cell(final_idx)
         results.append({
             "profile_link": pl_key,
-            "agent_age": _cell(age_col),
-            "agent_final": _cell(final_col),
+            "agent_age": agent_age,
+            "agent_final": agent_final,
             "labeling_final": _cell(labeling_final_col),
         })
     print(f"  [sheet2] 读到 {len(results)} 行已有数据")
@@ -415,7 +441,6 @@ def _process_one(url: str) -> Dict[str, Any]:
 # flush: 批量写回 Sheet2
 # ---------------------------
 def _flush(results: List[Dict[str, Any]],
-           sheet2_rows: List[Dict[str, Any]],
            spreadsheet_token: str, sheet2_name: str,
            bearer: str, sheet_id: str) -> None:
     if not results:
@@ -552,6 +577,8 @@ def _flush(results: List[Dict[str, Any]],
             new_cells = {pl_col: url}
             new_cells.update(cells)
             _write_row_cells(spreadsheet_token, sheet_id, new_row_n, new_cells, bearer)
+            # 同一批次后续结果应命中刚写入的行，避免重复 URL 产生重复记录。
+            url_to_row1[url_key] = new_row_n
         written += 1
     print(f"  [flush] 已写回 {written} 条到 Sheet2 '{sheet2_name}'")
 
@@ -714,7 +741,7 @@ def main() -> int:
 
             if args.flush_every > 0 and (len(results_batch) % args.flush_every == 0):
                 try:
-                    _flush(results_batch, sheet2_rows, args.token, args.sheet2, bearer, sheet_id)
+                    _flush(results_batch, args.token, args.sheet2, bearer, sheet_id)
                 except Exception as exc:
                     # 不再把失败批次留在 results_batch 里累积，转入 failed_results 末尾重试
                     failed_results.extend(results_batch)
@@ -727,7 +754,7 @@ def main() -> int:
     remaining = results_batch + failed_results
     if remaining:
         try:
-            _flush(remaining, sheet2_rows, args.token, args.sheet2, bearer, sheet_id)
+            _flush(remaining, args.token, args.sheet2, bearer, sheet_id)
         except Exception as exc:
             print(f"  ⚠️  final flush 失败！{len(remaining)} 条未能写回 Sheet2: {exc}\n"
                   f"     结果已落盘在 screenshots/*_v6.json，可运行 "

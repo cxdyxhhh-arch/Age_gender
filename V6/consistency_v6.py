@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +47,7 @@ AGENT_ERROR_COL = "[Agent-Labeling]error"
 AGENT_CONSENSUS_LEVEL_COL = "[Agent-Labeling]consensus_level"
 AGENT_ACCEPTED_GT_COL = "[Agent-Labeling]accepted_gt"
 AGENT_TIER1_CONSENSUS_LEVEL_COL = "[Agent-Labeling]tier1_consensus_level"
+AGENT_TIER2_CONSENSUS_LEVEL_COL = "[Agent-Labeling]tier2_consensus_level"
 AGENT_TIER1_ACCEPTED_GT_COL = "[Agent-Labeling]tier1_accepted_gt"
 PROFILE_LINK_COL = "profile_link"
 
@@ -253,6 +255,13 @@ def main() -> int:
                     return i
         return None
 
+    def _find_exact(title: str) -> Optional[int]:
+        title = title.lower()
+        for i, h in enumerate(header):
+            if h.lower() == title:
+                return i
+        return None
+
     profile_link_col = _find_col("profile_link")
     human_age_col = _find_col(HUMAN_AGE_COL)
     human_final_col = _find_col(HUMAN_FINAL_COL)
@@ -262,18 +271,37 @@ def main() -> int:
     consensus_level_col = _find_col(AGENT_CONSENSUS_LEVEL_COL)
     accepted_gt_col = _find_col(AGENT_ACCEPTED_GT_COL)
     tier1_consensus_level_col = _find_col(AGENT_TIER1_CONSENSUS_LEVEL_COL)
+    tier2_consensus_level_col = _find_col(AGENT_TIER2_CONSENSUS_LEVEL_COL)
     tier1_accepted_gt_col = _find_col(AGENT_TIER1_ACCEPTED_GT_COL)
+
+    agent_names = [
+        name.strip() for name in (os.getenv("AGENT_CONFIGS") or "").split(",")
+        if name.strip()
+    ]
+    agent_columns = {
+        name: (
+            _find_exact(f"[Agent-Labeling]{name}_age"),
+            _find_exact(f"[Agent-Labeling]{name}_final_result"),
+        )
+        for name in agent_names
+    }
+    multi_agent_mode = any(age is not None or final is not None
+                           for age, final in agent_columns.values())
 
     if profile_link_col is None:
         print(f"找不到 profile_link 列。表头: {header[:30]}")
         return 2
 
     # 逐列读取，避免整表读；分页读，连续空页就停
-    all_cols_to_read = [i for i in [profile_link_col, human_age_col or 0, human_final_col or 0,
-                                    agent_age_col or 0, agent_final_col or 0, agent_error_col or 0,
-                                    consensus_level_col or 0, accepted_gt_col or 0,
-                                    tier1_consensus_level_col or 0, tier1_accepted_gt_col or 0]
-                        if i is not None]
+    agent_result_cols = [
+        i for pair in agent_columns.values() for i in pair if i is not None
+    ]
+    all_cols_to_read = [i for i in [profile_link_col, human_age_col, human_final_col,
+                                    agent_age_col, agent_final_col, agent_error_col,
+                                    consensus_level_col, accepted_gt_col,
+                                    tier1_consensus_level_col, tier2_consensus_level_col,
+                                    tier1_accepted_gt_col]
+                        if i is not None] + agent_result_cols
     max_col = max(all_cols_to_read)
 
     rows = _read_rows_paginated(args.token, sheet_id, "A", _col_letter(max_col), bearer,
@@ -302,13 +330,35 @@ def main() -> int:
 
     for row in rows:
         human_age, human_gender, pl = _cell_to_age_gender(row, profile_link_col, human_age_col, human_final_col)
-        agent_age, agent_gender, _ = _cell_to_age_gender(row, profile_link_col, agent_age_col, agent_final_col)
+        if multi_agent_mode:
+            votes = []
+            for age_col, final_col in agent_columns.values():
+                age, gender, _ = _cell_to_age_gender(row, profile_link_col, age_col, final_col)
+                if age and age[0] not in (SPEC["age"]["unknown_label"], "error", "unavailable"):
+                    votes.append((tuple(age), gender))
+            if votes:
+                (best_age, agent_gender), _ = Counter(votes).most_common(1)[0]
+                agent_age = list(best_age)
+            else:
+                agent_age, agent_gender = [], ""
+        else:
+            agent_age, agent_gender, _ = _cell_to_age_gender(
+                row, profile_link_col, agent_age_col, agent_final_col
+            )
         consensus_level = "none"
         if consensus_level_col is not None and consensus_level_col < len(row):
             consensus_level = str(row[consensus_level_col] or "none").strip().lower() or "none"
+        accepted_gt = consensus_level in ("strict", "balanced")
+        if multi_agent_mode and tier2_consensus_level_col is not None:
+            raw_level = row[tier2_consensus_level_col] if tier2_consensus_level_col < len(row) else 0
+            try:
+                level = int(raw_level or 0)
+            except (TypeError, ValueError):
+                level = 0
+            consensus_level = "strict" if level == 1 else "balanced" if level > 1 else "none"
+            accepted_gt = level > 0
         if consensus_level not in consensus_counts:
             consensus_counts[consensus_level] = 0
-        accepted_gt = consensus_level in ("strict", "balanced")
         if accepted_gt_col is not None and accepted_gt_col < len(row):
             raw_accepted = str(row[accepted_gt_col] or "").strip().lower()
             if raw_accepted in ("true", "1", "yes", "y", "是"):
@@ -319,9 +369,19 @@ def main() -> int:
         tier1_consensus_level = "none"
         if tier1_consensus_level_col is not None and tier1_consensus_level_col < len(row):
             tier1_consensus_level = str(row[tier1_consensus_level_col] or "none").strip().lower() or "none"
+        tier1_accepted_gt = tier1_consensus_level in ("strict", "balanced")
+        if multi_agent_mode:
+            raw_level = row[tier1_consensus_level_col] if (
+                tier1_consensus_level_col is not None and tier1_consensus_level_col < len(row)
+            ) else 0
+            try:
+                level = int(raw_level or 0)
+            except (TypeError, ValueError):
+                level = 0
+            tier1_consensus_level = "strict" if level == 1 else "balanced" if level > 1 else "none"
+            tier1_accepted_gt = level > 0
         if tier1_consensus_level not in tier1_consensus_counts:
             tier1_consensus_counts[tier1_consensus_level] = 0
-        tier1_accepted_gt = tier1_consensus_level in ("strict", "balanced")
         if tier1_accepted_gt_col is not None and tier1_accepted_gt_col < len(row):
             raw_t1_accepted = str(row[tier1_accepted_gt_col] or "").strip().lower()
             if raw_t1_accepted in ("true", "1", "yes", "y", "是"):
