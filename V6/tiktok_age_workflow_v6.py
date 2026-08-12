@@ -25,6 +25,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -65,6 +66,13 @@ WORKER_TAG = re.sub(r"[^A-Za-z0-9_.-]", "_", os.getenv("WORKER_TAG", "") or "")
 # --------------------
 class PageUnavailableError(RuntimeError):
     """用户主页不可用（private / 不存在 / 被封禁等）。"""
+
+
+class AgentRunMode(str, Enum):
+    """多 Agent 调度模式。"""
+
+    PARALLEL = "parallel"
+    HIGH_CONFIDENCE_GATE = "high_confidence_gate"
 
 
 # --------------------
@@ -894,6 +902,15 @@ def _agent_names() -> List[str]:
     return names or ["agent_a", "agent_b", "agent_c"]
 
 
+def _agent_run_mode() -> AgentRunMode:
+    raw = (os.getenv("AGENT_RUN_MODE") or AgentRunMode.PARALLEL.value).strip().lower()
+    try:
+        return AgentRunMode(raw)
+    except ValueError as exc:
+        allowed = ", ".join(mode.value for mode in AgentRunMode)
+        raise ValueError(f"AGENT_RUN_MODE={raw!r} 无效，可选值: {allowed}") from exc
+
+
 def _agent_prefix(agent_name: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "_", agent_name.upper()).strip("_")
 
@@ -1106,6 +1123,86 @@ def _run_one_agent(agent_name: str,
         }
 
 
+def _run_agents(agent_names: List[str],
+                user_prompt: str,
+                avatar_mime: str,
+                avatar_b64: str,
+                page_mime: str,
+                page_b64: str) -> Dict[str, Dict[str, Any]]:
+    mode = _agent_run_mode()
+    votes: Dict[str, Dict[str, Any]] = {}
+
+    def run_one(name: str) -> Dict[str, Any]:
+        vote = _run_one_agent(
+            name, user_prompt, avatar_mime, avatar_b64, page_mime, page_b64,
+        )
+        print(f"  [v6:{name}] age={vote.get('age')} gender={vote.get('gender')} "
+              f"conf={vote.get('confidence')}"
+              + (f" err={vote.get('error')}" if vote.get("error") else ""))
+        return vote
+
+    if mode == AgentRunMode.HIGH_CONFIDENCE_GATE:
+        if len(agent_names) != 2:
+            raise ValueError(
+                "AGENT_RUN_MODE=high_confidence_gate 要求 AGENT_CONFIGS 恰好配置两个 agent"
+            )
+        first, second = agent_names
+        print(f"  [v6] high confidence 门控调用: {first} -> {second}")
+        votes[first] = run_one(first)
+        first_is_high = (
+            not votes[first].get("error")
+            and votes[first].get("confidence") == "high"
+        )
+        if first_is_high:
+            votes[second] = run_one(second)
+        else:
+            reason = (
+                "首个 agent 调用失败"
+                if votes[first].get("error")
+                else f"首个 agent confidence={votes[first].get('confidence')}"
+            )
+            votes[second] = {
+                "agent": second,
+                "age": None,
+                "tier1": None,
+                "tier2": None,
+                "gender": None,
+                "confidence": None,
+                "final_result": None,
+                "skipped": True,
+                "skip_reason": reason,
+            }
+            print(f"  [v6:{second}] skipped: {reason}")
+        return votes
+
+    max_workers = max(
+        1,
+        min(len(agent_names), int(os.getenv("NUM_AGENTS") or len(agent_names) or 1)),
+    )
+    print(f"  [v6] 并行调用 {len(agent_names)} 个 agent: {', '.join(agent_names)}")
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {
+            pool.submit(
+                _run_one_agent,
+                name,
+                user_prompt,
+                avatar_mime,
+                avatar_b64,
+                page_mime,
+                page_b64,
+            ): name
+            for name in agent_names
+        }
+        for fut in as_completed(future_map):
+            name = future_map[fut]
+            votes[name] = fut.result()
+            vote = votes[name]
+            print(f"  [v6:{name}] age={vote.get('age')} gender={vote.get('gender')} "
+                  f"conf={vote.get('confidence')}"
+                  + (f" err={vote.get('error')}" if vote.get("error") else ""))
+    return votes
+
+
 # --------------------
 # 可配的分层一致性判定
 # --------------------
@@ -1181,7 +1278,7 @@ def _tier1_consensus_level(votes: Dict[str, Dict[str, Any]], thresholds: List[in
     keys = [
         v.get("tier1") or "Unknown"
         for v in votes.values()
-        if not v.get("error")
+        if not v.get("error") and not v.get("skipped")
     ]
     return _level_from_agreement(_max_agreement(keys), thresholds)
 
@@ -1191,7 +1288,7 @@ def _tier2_consensus_level(votes: Dict[str, Dict[str, Any]], thresholds: List[in
     keys = [
         (v.get("tier1") or "Unknown", v.get("tier2"))
         for v in votes.values()
-        if not v.get("error")
+        if not v.get("error") and not v.get("skipped")
     ]
     return _level_from_agreement(_max_agreement(keys), thresholds)
 
@@ -1245,21 +1342,9 @@ def estimate_age_with_llm_v6(snap: Dict[str, Any]) -> Dict[str, Any]:
     page_b64, page_mime = _prepare_image_for_llm(Path(str(page_path)))
 
     agent_names = _agent_names()
-    votes: Dict[str, Dict[str, Any]] = {}
-    max_workers = max(1, min(len(agent_names), int(os.getenv("NUM_AGENTS") or len(agent_names) or 1)))
-    print(f"  [v6] 并行调用 {len(agent_names)} 个 agent: {', '.join(agent_names)}")
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_map = {
-            pool.submit(_run_one_agent, name, user_prompt, avatar_mime, avatar_b64, page_mime, page_b64): name
-            for name in agent_names
-        }
-        for fut in as_completed(future_map):
-            name = future_map[fut]
-            votes[name] = fut.result()
-            v = votes[name]
-            print(f"  [v6:{name}] age={v.get('age')} gender={v.get('gender')} "
-                  f"conf={v.get('confidence')}"
-                  + (f" err={v.get('error')}" if v.get("error") else ""))
+    votes = _run_agents(
+        agent_names, user_prompt, avatar_mime, avatar_b64, page_mime, page_b64,
+    )
 
     # 单 agent：完全等同 V5。失败时 re-raise，让 run() 产出 V5 结构的错误结果。
     if len(agent_names) == 1:
@@ -1280,13 +1365,23 @@ def estimate_age_with_llm_v6(snap: Dict[str, Any]) -> Dict[str, Any]:
             "age": v.get("age"),
             "final_result": v.get("final_result"),
             "confidence": v.get("confidence"),
+            "status": "skipped" if v.get("skipped") else ("error" if v.get("error") else "completed"),
         }
+        if v.get("skip_reason"):
+            agent_results[name]["skip_reason"] = v["skip_reason"]
 
     # 多数/全部 agent 调用失败时，结果是"假 Unknown"（网络/超时所致，非真判不出）。
     # 标记顶层 error 让 batch 计入 err 并便于重跑。
-    error_agents = {name: v.get("error") for name, v in votes.items() if v.get("error")}
+    executed_votes = {
+        name: vote for name, vote in votes.items() if not vote.get("skipped")
+    }
+    error_agents = {
+        name: vote.get("error")
+        for name, vote in executed_votes.items()
+        if vote.get("error")
+    }
     sample_error = ""
-    if error_agents and len(error_agents) > len(votes) / 2:
+    if error_agents and len(error_agents) > len(executed_votes) / 2:
         sample_error = "多数 agent 调用失败: " + "; ".join(
             f"{name}:{err}" for name, err in error_agents.items()
         )[:500]
