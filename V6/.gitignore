@@ -1,0 +1,29 @@
+# 导出目录（csv / xlsx 落盘）
+export_out/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# 本地环境配置（敏感：飞书 token）
+.env
+.env.local
+
+# IDE / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 日志 / 临时
+*.log
+*.tmp
