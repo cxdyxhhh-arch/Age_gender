@@ -78,9 +78,80 @@ AGENT_AGE_COL = "[Agent-Labeling]age"
 AGENT_FINAL_COL = "[Agent-Labeling]final_result"
 AGENT_ERROR_COL = "[Agent-Labeling]error"
 AGENT_CONFIDENCE_COL = "[Agent-Labeling]confidence"
+AGENT_REASONING_COL = "[Agent-Labeling]reasoning"
+AGENT_TIER1_COL = "[Agent-Labeling]tier1"
+AGENT_TIER2_COL = "[Agent-Labeling]tier2"
+AGENT_GENDER_COL = "[Agent-Labeling]gender"
+AGENT_EVIDENCE_COL = "[Agent-Labeling]evidence"
 # 多 agent 模式：可配的分层一致等级（整数；1=最严，0=未达成任何等级）
 AGENT_TIER1_LEVEL_COL = "[Agent-Labeling]tier1_consensus_level"
 AGENT_TIER2_LEVEL_COL = "[Agent-Labeling]tier2_consensus_level"
+
+# 可选元数据列（从页面抓取的非 LLM 字段）
+META_HANDLE_COL = "handle"
+META_DISPLAY_NAME_COL = "display_name"
+META_BIO_COL = "bio"
+META_STATS_COL = "stats"
+
+
+# 输出列预设
+# profile_link 始终写入，不受配置影响
+_OUTPUT_PRESETS: Dict[str, List[str]] = {
+    # core: 保持 V6 原有行为，仅核心 4 列
+    "core": ["age", "final_result", "confidence", "error"],
+    # minimal: core + reasoning（便于人工快速 review）
+    "minimal": ["age", "final_result", "confidence", "reasoning", "error"],
+    # standard: minimal + tier1/tier2/gender（拆分项便于筛选/排序）
+    "standard": ["age", "final_result", "confidence", "reasoning",
+                 "tier1", "tier2", "gender", "error"],
+    # full: 所有单值字段 + evidence（完整审计信息）
+    "full": ["age", "final_result", "confidence", "reasoning",
+             "tier1", "tier2", "gender", "evidence",
+             "handle", "display_name", "bio", "stats", "error"],
+}
+
+# 单 agent 模式下，字段 key -> (列名, 结果中取值的 key)
+_SINGLE_COL_MAP: Dict[str, Tuple[str, str]] = {
+    "age":          (AGENT_AGE_COL,          "age"),
+    "final_result": (AGENT_FINAL_COL,        "final_result"),
+    "confidence":   (AGENT_CONFIDENCE_COL,   "confidence"),
+    "reasoning":    (AGENT_REASONING_COL,    "reasoning"),
+    "tier1":        (AGENT_TIER1_COL,        "tier1"),
+    "tier2":        (AGENT_TIER2_COL,        "tier2"),
+    "gender":       (AGENT_GENDER_COL,       "gender"),
+    "evidence":     (AGENT_EVIDENCE_COL,     "evidence"),
+    "handle":       (META_HANDLE_COL,        "handle"),
+    "display_name": (META_DISPLAY_NAME_COL,  "display_name"),
+    "bio":          (META_BIO_COL,           "bio"),
+    "stats":        (META_STATS_COL,         "stats"),
+    "error":        (AGENT_ERROR_COL,        "error"),
+}
+
+# 多 agent 模式下，每个 agent 可附加的字段（age/final_result/confidence 始终写）
+_MULTI_AGENT_EXTRA_FIELDS = {"reasoning", "evidence"}
+
+
+def _resolve_output_cols() -> Tuple[List[str], List[str]]:
+    """解析 OUTPUT_COLS 环境变量，返回 (单agent字段列表, 多agent每agent额外字段列表)。
+
+    OUTPUT_COLS 取值:
+      - 预设名: core / minimal / standard / full
+      - 逗号分隔自定义字段列表: age,final_result,confidence,reasoning
+    未设置时默认 core（保持向后兼容）。
+    profile_link 始终写入，不需要在列表中指定。
+    """
+    raw = (os.getenv("OUTPUT_COLS") or "core").strip().lower()
+    if raw in _OUTPUT_PRESETS:
+        single_fields = list(_OUTPUT_PRESETS[raw])
+    else:
+        single_fields = [s.strip() for s in raw.split(",") if s.strip()]
+        # 过滤无效字段名
+        single_fields = [f for f in single_fields if f in _SINGLE_COL_MAP]
+
+    # 多 agent 模式下，共识等级列 + 每 agent 的 age/final_result/confidence 始终写，
+    # 额外字段从 single_fields 中提取属于 _MULTI_AGENT_EXTRA_FIELDS 的子集
+    multi_extra = [f for f in single_fields if f in _MULTI_AGENT_EXTRA_FIELDS]
+    return single_fields, multi_extra
 
 
 def _agent_names() -> List[str]:
@@ -459,27 +530,28 @@ def _flush(results: List[Dict[str, Any]],
             header.pop()
 
     single_mode = len(_agent_names()) == 1
+    single_fields, multi_extra_fields = _resolve_output_cols()
+
     if single_mode:
-        required_headers = [
-            "profile_link",
-            AGENT_AGE_COL,
-            AGENT_FINAL_COL,
-            AGENT_CONFIDENCE_COL,
-            AGENT_ERROR_COL,
-        ]
+        required_headers = ["profile_link"]
+        for f in single_fields:
+            if f in _SINGLE_COL_MAP:
+                required_headers.append(_SINGLE_COL_MAP[f][0])
     else:
         required_headers = [
             "profile_link",
             AGENT_TIER1_LEVEL_COL,
             AGENT_TIER2_LEVEL_COL,
         ]
-
         for an in _agent_names():
             required_headers.extend([
                 _agent_col_name(an, "age"),
                 _agent_col_name(an, "final_result"),
                 _agent_col_name(an, "confidence"),
             ])
+            for ef in multi_extra_fields:
+                col_suffix = _SINGLE_COL_MAP[ef][0].replace("[Agent-Labeling]", "")
+                required_headers.append(_agent_col_name(an, col_suffix))
         required_headers.append(AGENT_ERROR_COL)
 
     col_indices: Dict[str, int] = {}
@@ -535,25 +607,31 @@ def _flush(results: List[Dict[str, Any]],
                 return json.dumps(val, ensure_ascii=False)
             return str(val)
 
-        err_val = _as_str(r.get("error")) or ""
-
         if single_mode:
-            age_val = json.dumps(r.get("age") or r.get("final_result", {}).get("age", ["Unknown"]),
-                                  ensure_ascii=False)
-            final_val = json.dumps(r.get("final_result") or {
-                "age": r.get("age", ["Unknown"]),
-                "gender": r.get("gender", "unknown")
-            }, ensure_ascii=False)
-            conf_val = _as_str(r.get("confidence")) or ""
-            cells = {
-                col_indices[AGENT_AGE_COL]: age_val,
-                col_indices[AGENT_FINAL_COL]: final_val,
-                col_indices[AGENT_CONFIDENCE_COL]: conf_val,
-                col_indices[AGENT_ERROR_COL]: err_val,
-            }
+            cells: Dict[int, str] = {}
+            for f in single_fields:
+                if f not in _SINGLE_COL_MAP:
+                    continue
+                col_name, result_key = _SINGLE_COL_MAP[f]
+                if col_name not in col_indices:
+                    continue
+                if f == "age":
+                    val = json.dumps(
+                        r.get("age") or r.get("final_result", {}).get("age", ["Unknown"]),
+                        ensure_ascii=False,
+                    )
+                elif f == "final_result":
+                    val = json.dumps(r.get("final_result") or {
+                        "age": r.get("age", ["Unknown"]),
+                        "gender": r.get("gender", "unknown"),
+                    }, ensure_ascii=False)
+                else:
+                    val = _as_str(r.get(result_key))
+                cells[col_indices[col_name]] = val
         else:
             tier1_level_val = _as_str(r.get("tier1_consensus_level", 0))
             tier2_level_val = _as_str(r.get("tier2_consensus_level", 0))
+            err_val = _as_str(r.get("error")) or ""
 
             cells = {
                 col_indices[AGENT_TIER1_LEVEL_COL]: tier1_level_val,
@@ -562,11 +640,19 @@ def _flush(results: List[Dict[str, Any]],
             }
 
             agent_results_data = r.get("agent_results") or {}
+            agent_votes_raw = r.get("agent_votes_raw") or {}
             for an in _agent_names():
                 ar = agent_results_data.get(an) or {}
                 cells[col_indices[_agent_col_name(an, "age")]] = _as_str(ar.get("age"))
                 cells[col_indices[_agent_col_name(an, "final_result")]] = _as_str(ar.get("final_result"))
                 cells[col_indices[_agent_col_name(an, "confidence")]] = _as_str(ar.get("confidence"))
+                # 额外字段（reasoning/evidence）从 agent_votes_raw 里取
+                vote = agent_votes_raw.get(an) or {}
+                for ef in multi_extra_fields:
+                    col_suffix = _SINGLE_COL_MAP[ef][0].replace("[Agent-Labeling]", "")
+                    col_key = _agent_col_name(an, col_suffix)
+                    if col_key in col_indices:
+                        cells[col_indices[col_key]] = _as_str(vote.get(ef))
 
         if existing_row:
             row_n = existing_row
@@ -580,7 +666,7 @@ def _flush(results: List[Dict[str, Any]],
             # 同一批次后续结果应命中刚写入的行，避免重复 URL 产生重复记录。
             url_to_row1[url_key] = new_row_n
         written += 1
-    print(f"  [flush] 已写回 {written} 条到 Sheet2 '{sheet2_name}'")
+    print(f"  [flush] 已写回 {written} 条到 Sheet2 '{sheet2_name}' (output_cols={single_fields if single_mode else 'multi'})")
 
 
 def _start_screenshot_cleaner(interval_minutes: int = 10,
