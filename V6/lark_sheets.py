@@ -12,10 +12,11 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
-import sys
+import ssl
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -70,6 +71,30 @@ def _base_url() -> str:
     return os.environ.get("FEISHU_BASE_URL") or "https://open.larkoffice.com"
 
 
+def _request_json(req: urllib.request.Request, timeout: int = 30, retries: int = 4) -> dict:
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            if exc.code in (429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(min(8, attempt * 2))
+                continue
+            raise RuntimeError(f"Lark API HTTP {exc.code}: {raw[:500]}") from exc
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            msg = str(reason)
+            retryable = isinstance(reason, ssl.SSLError) or any(
+                key in msg.lower() for key in ("eof", "timed out", "reset", "closed")
+            )
+            if retryable and attempt < retries:
+                time.sleep(min(8, attempt * 2))
+                continue
+            raise RuntimeError(f"Lark API network error: {msg}") from exc
+    raise RuntimeError("Lark API request failed after retries")
+
+
 def _post_json(path: str, body: dict, params: Optional[dict] = None, token: Optional[str] = None) -> dict:
     url = _base_url() + path
     if params:
@@ -79,12 +104,7 @@ def _post_json(path: str, body: dict, params: Optional[dict] = None, token: Opti
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Lark API HTTP {exc.code}: {raw[:500]}") from exc
+    return _request_json(req)
 
 
 def _get_json(path: str, params: Optional[dict] = None, token: Optional[str] = None) -> dict:
@@ -95,8 +115,7 @@ def _get_json(path: str, params: Optional[dict] = None, token: Optional[str] = N
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    return _request_json(req)
 
 
 def _put_json(path: str, body: dict, params: Optional[dict] = None, token: Optional[str] = None) -> dict:
@@ -108,12 +127,7 @@ def _put_json(path: str, body: dict, params: Optional[dict] = None, token: Optio
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers, method="PUT")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Lark API HTTP {exc.code}: {raw[:500]}") from exc
+    return _request_json(req)
 
 
 # ============================================================= #
@@ -463,12 +477,19 @@ def clear_output_sheet() -> None:
 
 
 if __name__ == "__main__":
-    import sys
+    parser = argparse.ArgumentParser(description="飞书 / Lark Sheets 读写工具")
+    parser.add_argument("--list-sheets", action="store_true", help="列出表格里的所有 sheet")
+    parser.add_argument("--read", action="store_true", help="从输入表读取 URL 列表")
+    parser.add_argument("--token", default="", help="配合 --list-sheets 使用，直接指定单个表格 token")
+    args = parser.parse_args()
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--list-sheets":
+    if args.list_sheets:
         # 同时列出输入/输出两个表格
-        for name, token_fn in [("输入表", input_spreadsheet_token),
-                                ("输出表", output_spreadsheet_token)]:
+        targets = [("指定表", lambda: args.token)] if args.token else [
+            ("输入表", input_spreadsheet_token),
+            ("输出表", output_spreadsheet_token),
+        ]
+        for name, token_fn in targets:
             try:
                 spreadsheet = token_fn()
                 token = _token_from_env()
@@ -485,7 +506,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"[{name}] 读取失败: {e}")
             print()
-    elif len(sys.argv) >= 2 and sys.argv[1] == "--read":
+    elif args.read:
         urls = read_urls(max_rows=1000)
         print(f"从输入表 '{input_sheet_name()}' 的 '{input_url_column()}' 列读到 {len(urls)} 条 URL:")
         for u in urls[:10]:
@@ -494,5 +515,6 @@ if __name__ == "__main__":
             print(f"  ... 共 {len(urls)} 条")
     else:
         print("用法:")
-        print("  python lark_sheets.py --list-sheets   # 列出输入表 / 输出表的所有 sheet")
-        print("  python lark_sheets.py --read           # 从输入表读 URL 列表")
+        print("  python lark_sheets.py --list-sheets                 # 列出输入表 / 输出表的所有 sheet")
+        print("  python lark_sheets.py --list-sheets --token TOKEN   # 列出指定表格的所有 sheet")
+        print("  python lark_sheets.py --read                         # 从输入表读 URL 列表")
